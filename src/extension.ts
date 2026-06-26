@@ -1,6 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 import { randomUUID } from 'node:crypto';
 import { DebugMCPServer } from './debugMCPServer';
 import { AgentConfigurationManager } from './utils/agentConfigurationManager';
@@ -27,23 +30,112 @@ async function getOrCreateAuthToken(context: vscode.ExtensionContext): Promise<s
     return token;
 }
 
+/** True when the extension host is Cursor rather than stock VS Code. */
+function isCursor(): boolean {
+    const appName = (vscode.env.appName || '').toLowerCase();
+    return appName.includes('cursor') || vscode.env.uriScheme === 'cursor';
+}
+
 /**
- * Register the running HTTP MCP server with the host editor's native API so the
- * auth token is delivered to the editor's built-in MCP client without the user
- * editing any config file.
+ * Upsert a single `debugmcp` entry in Cursor's global MCP config
+ * (`~/.cursor/mcp.json`). This is the mechanism Cursor's "Tools & MCPs" UI
+ * actually reads — servers registered via the VS Code `lm` provider API or
+ * Cursor's proposed `cursor.mcp` API are not surfaced there for ordinary
+ * published extensions. Only the `debugmcp` key is touched; all other servers
+ * and fields are preserved. Returns true on success.
+ */
+function upsertCursorMcpJson(serverUrl: string): boolean {
+    const configPath = path.join(os.homedir(), '.cursor', 'mcp.json');
+    let json: any = {};
+
+    if (fs.existsSync(configPath)) {
+        try {
+            json = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        } catch (error) {
+            // Don't clobber a file we can't safely parse (e.g. it has comments).
+            logger.warn(`Could not parse ${configPath}; leaving it untouched`, error);
+            return false;
+        }
+    } else {
+        fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    }
+
+    if (!json.mcpServers || typeof json.mcpServers !== 'object') {
+        json.mcpServers = {};
+    }
+
+    const existing = (json.mcpServers.debugmcp && typeof json.mcpServers.debugmcp === 'object')
+        ? json.mcpServers.debugmcp
+        : {};
+    if (existing.url === serverUrl) {
+        return true; // Already up to date — avoid a needless write.
+    }
+
+    json.mcpServers.debugmcp = { ...existing, url: serverUrl };
+    fs.writeFileSync(configPath, JSON.stringify(json, null, 2) + '\n', 'utf8');
+    return true;
+}
+
+/**
+ * Register the running HTTP MCP server with the host editor so the auth token
+ * is delivered to the editor's built-in MCP client without the user editing any
+ * config file.
  *
+ * - Cursor: vscode.cursor.mcp.registerServer (Cursor's documented extension API:
+ *   https://cursor.com/docs/extension-api). Cursor currently drops headers
+ *   passed this way (https://forum.cursor.com/t/152267), so the token is carried
+ *   in the URL query — Cursor's sanctioned workaround when you control the
+ *   server, which the DebugMCP server accepts. If that API is ever unavailable,
+ *   fall back to writing a single entry in ~/.cursor/mcp.json.
  * - VS Code (and forks implementing the API): vscode.lm.registerMcpServerDefinitionProvider
- *   with an McpHttpServerDefinition carrying an Authorization header.
- * - Cursor: vscode.cursor.mcp.registerServer. Cursor currently drops custom
- *   headers passed this way (https://github.com/cursor/cursor/issues/3536), so
- *   the token is also carried in the URL query, which the server accepts.
+ *   with an McpHttpServerDefinition carrying an Authorization header. (Cursor
+ *   also exposes this API, but its "Tools & MCPs" UI does not surface
+ *   lm-provider registrations, so it is only used outside Cursor.)
  *
- * Returns a Disposable that unregisters, or null if no native API is available
- * (in which case the agent config-file path provides the token instead).
+ * Returns a Disposable, or null if no path was available (in which case the
+ * agent config-file path provides the token instead).
  */
 function registerWithEditor(baseUrl: string, token: string): vscode.Disposable | null {
     const anyVscode = vscode as any;
     const authHeader = { Authorization: `Bearer ${token}` };
+    const urlWithToken = `${baseUrl}?token=${encodeURIComponent(token)}`;
+
+    // Cursor's documented extension API. Token is in the URL to work around the
+    // known dropped-headers bug; the header is included too so it "just works"
+    // once Cursor ships the upstream fix.
+    const cursorMcp = anyVscode.cursor?.mcp;
+    if (cursorMcp && typeof cursorMcp.registerServer === 'function') {
+        try {
+            cursorMcp.registerServer({
+                name: 'debugmcp',
+                server: { url: urlWithToken, headers: authHeader }
+            });
+            logger.info('Registered DebugMCP via vscode.cursor.mcp.registerServer (query-param auth)');
+            return new vscode.Disposable(() => {
+                try {
+                    cursorMcp.unregisterServer?.('debugmcp');
+                } catch (error) {
+                    logger.warn('Failed to unregister DebugMCP from Cursor', error);
+                }
+            });
+        } catch (error) {
+            logger.warn('Cursor MCP registration failed; trying fallbacks', error);
+        }
+    }
+
+    // In Cursor, never use the lm provider API (its registrations are not shown
+    // in Tools & MCPs). Fall back to writing the global mcp.json instead.
+    if (isCursor()) {
+        try {
+            if (upsertCursorMcpJson(urlWithToken)) {
+                logger.info('Registered DebugMCP in ~/.cursor/mcp.json (fallback)');
+                return new vscode.Disposable(() => { /* entry intentionally persists */ });
+            }
+        } catch (error) {
+            logger.warn('Failed to register DebugMCP in ~/.cursor/mcp.json', error);
+        }
+        return null;
+    }
 
     // VS Code native MCP provider API (typed; supports headers reliably).
     const lm = anyVscode.lm;
@@ -60,28 +152,6 @@ function registerWithEditor(baseUrl: string, token: string): vscode.Disposable |
             return disposable;
         } catch (error) {
             logger.warn('VS Code MCP provider registration failed; falling back to config files', error);
-        }
-    }
-
-    // Cursor extension API.
-    const cursorMcp = anyVscode.cursor?.mcp;
-    if (cursorMcp && typeof cursorMcp.registerServer === 'function') {
-        try {
-            const urlWithToken = `${baseUrl}?token=${encodeURIComponent(token)}`;
-            cursorMcp.registerServer({
-                name: 'debugmcp',
-                server: { url: urlWithToken, headers: authHeader }
-            });
-            logger.info('Registered DebugMCP via the Cursor MCP extension API (query-param auth)');
-            return new vscode.Disposable(() => {
-                try {
-                    cursorMcp.unregisterServer?.('debugmcp');
-                } catch (error) {
-                    logger.warn('Failed to unregister DebugMCP from Cursor', error);
-                }
-            });
-        } catch (error) {
-            logger.warn('Cursor MCP registration failed; falling back to config files', error);
         }
     }
 
