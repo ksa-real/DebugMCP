@@ -3,7 +3,7 @@
 import * as vscode from 'vscode';
 import { z } from 'zod';
 import * as http from 'http';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import {
     DebuggingExecutor,
     ConfigurationManager,
@@ -99,10 +99,59 @@ export function isLoopbackOrigin(originHeader: string | undefined): boolean {
     }
 }
 
+/**
+ * Constant-time string comparison. Both inputs are SHA-256 hashed first so the
+ * comparison runs over fixed-length buffers (no early-exit and no length leak).
+ */
+export function safeTokenEqual(a: string | undefined, b: string | undefined): boolean {
+    if (!a || !b) {
+        return false;
+    }
+    const ha = createHash('sha256').update(a).digest();
+    const hb = createHash('sha256').update(b).digest();
+    return timingSafeEqual(ha, hb);
+}
+
+/**
+ * Extract the caller-supplied auth token from a request. Accepts either an
+ * `Authorization: Bearer <token>` header (preferred) or a `?token=<token>`
+ * query parameter. The query fallback exists because Cursor's programmatic
+ * `registerServer` API currently drops custom headers
+ * (https://github.com/cursor/cursor/issues/3536), so the token must travel in
+ * the URL for that client.
+ */
+export function extractRequestToken(req: { headers: http.IncomingHttpHeaders; query?: any; url?: string }): string | undefined {
+    const authHeader = req.headers['authorization'];
+    if (typeof authHeader === 'string') {
+        const match = authHeader.match(/^Bearer\s+(.+)$/i);
+        if (match) {
+            return match[1].trim();
+        }
+    }
+    // Express populates req.query; fall back to parsing req.url if absent.
+    const fromQuery = req.query?.token;
+    if (typeof fromQuery === 'string' && fromQuery.length > 0) {
+        return fromQuery;
+    }
+    if (req.url) {
+        try {
+            const parsed = new URL(req.url, 'http://localhost');
+            const t = parsed.searchParams.get('token');
+            if (t) {
+                return t;
+            }
+        } catch {
+            // ignore malformed URL
+        }
+    }
+    return undefined;
+}
+
 export class DebugMCPServer {
     private httpServers: http.Server[] = [];
     private port: number;
     private hosts: string[];
+    private authToken?: string;
     private initialized: boolean = false;
     private debuggingHandler: IDebuggingHandler;
     // Active Streamable-HTTP transports keyed by MCP session id. The transport
@@ -110,13 +159,16 @@ export class DebugMCPServer {
     // POST (requests), GET (server->client SSE stream), and DELETE (teardown).
     private transports: Record<string, StreamableHTTPServerTransport> = {};
 
-    constructor(port: number, timeoutInSeconds: number, host: string | string[] = ['127.0.0.1', '::1']) {
+    constructor(port: number, timeoutInSeconds: number, host: string | string[] = ['127.0.0.1', '::1'], authToken?: string) {
         // Initialize the debugging components with dependency injection
         const executor = new DebuggingExecutor();
         const configManager = new ConfigurationManager();
         this.debuggingHandler = new DebuggingHandler(executor, configManager, timeoutInSeconds);
         this.port = port;
         this.hosts = Array.isArray(host) ? host : [host];
+        // When set, every request must present this token (Bearer header or
+        // ?token= query). Unset = legacy unauthenticated mode (back-compat).
+        this.authToken = authToken;
     }
 
     /**
@@ -398,6 +450,25 @@ export class DebugMCPServer {
                         id: null
                     });
                     return;
+                }
+                // Require a valid auth token when one is configured. This closes the
+                // "any local process can drive the debugger" gap: the token is minted
+                // by the extension and delivered to the client out-of-band (VS Code MCP
+                // provider header, Cursor registerServer URL, or the agent config file).
+                if (this.authToken) {
+                    const provided = extractRequestToken(req);
+                    if (!safeTokenEqual(provided, this.authToken)) {
+                        logger.warn('Rejecting request with missing or invalid auth token');
+                        res.status(401).json({
+                            jsonrpc: '2.0',
+                            error: {
+                                code: -32001,
+                                message: 'Unauthorized: missing or invalid token'
+                            },
+                            id: null
+                        });
+                        return;
+                    }
                 }
                 next();
             });
