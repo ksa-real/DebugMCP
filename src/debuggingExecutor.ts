@@ -144,15 +144,13 @@ export class DebuggingExecutor implements IDebuggingExecutor {
             );
         }
 
-        // Trigger test discovery before dispatching. Some controllers (notably
-        // Python's) lazily discover tests on first Test Explorer open; without
-        // this, testing.debugAtCursor silently no-ops because no TestItem exists
-        // at the cursor yet. refreshTests typically resolves once discovery is
-        // complete, but we add a small grace period for controllers that report
-        // completion before all TestItems are registered.
+        // Trigger and await test discovery before dispatching. Some controllers
+        // (notably Python's) lazily discover tests on first Test Explorer open;
+        // without this, testing.debugAtCursor silently no-ops because no TestItem
+        // exists at the cursor yet. The command's completion is the only
+        // readiness signal VS Code exposes, so do not add a speculative sleep.
         try {
             await vscode.commands.executeCommand('testing.refreshTests');
-            await new Promise(resolve => setTimeout(resolve, 300));
         } catch {
             // Not fatal — debugAtCursor may still work if tests were already discovered.
         }
