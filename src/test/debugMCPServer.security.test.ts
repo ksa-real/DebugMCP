@@ -4,7 +4,7 @@ import * as assert from 'assert';
 import * as http from 'http';
 import * as net from 'net';
 import * as os from 'os';
-import { DebugMCPServer, isLoopbackHost, isLoopbackOrigin } from '../debugMCPServer';
+import { DebugMCPServer, isLoopbackHost, isLoopbackOrigin, safeTokenEqual, extractRequestToken } from '../debugMCPServer';
 
 suite('DebugMCPServer security', () => {
 
@@ -291,6 +291,100 @@ suite('DebugMCPServer security', () => {
         test('GET /mcp with an unknown session id is rejected (400)', async () => {
             const res = await getMcp({ 'mcp-session-id': 'does-not-exist' });
             assert.strictEqual(res.status, 400, `GET /mcp with bogus session must be 400, got ${res.status}`);
+        });
+    });
+
+    suite('safeTokenEqual', () => {
+        test('matches identical tokens, rejects mismatches and empties', () => {
+            assert.strictEqual(safeTokenEqual('abc-123', 'abc-123'), true);
+            assert.strictEqual(safeTokenEqual('abc-123', 'abc-124'), false);
+            assert.strictEqual(safeTokenEqual('abc', 'abc-longer'), false);
+            assert.strictEqual(safeTokenEqual(undefined, 'abc'), false);
+            assert.strictEqual(safeTokenEqual('abc', undefined), false);
+            assert.strictEqual(safeTokenEqual('', ''), false);
+        });
+    });
+
+    suite('extractRequestToken', () => {
+        test('reads a Bearer Authorization header (case-insensitive)', () => {
+            assert.strictEqual(extractRequestToken({ headers: { authorization: 'Bearer tok-1' } }), 'tok-1');
+            assert.strictEqual(extractRequestToken({ headers: { authorization: 'bearer tok-2' } }), 'tok-2');
+        });
+        test('falls back to a ?token= query param', () => {
+            assert.strictEqual(extractRequestToken({ headers: {}, query: { token: 'q-tok' } }), 'q-tok');
+            assert.strictEqual(extractRequestToken({ headers: {}, url: '/mcp?token=u-tok' }), 'u-tok');
+        });
+        test('returns undefined when no token is present', () => {
+            assert.strictEqual(extractRequestToken({ headers: {} }), undefined);
+            assert.strictEqual(extractRequestToken({ headers: { authorization: 'Basic xyz' } }), undefined);
+        });
+    });
+
+    // Live enforcement: a token-enabled server must reject unauthenticated
+    // requests (401) and accept the token via either the Authorization header
+    // or the ?token= query param (the Cursor-compatible path).
+    suite('Token authentication (live)', () => {
+        const port = 30101;
+        const token = 'test-secret-token-abc123';
+        let server: DebugMCPServer;
+
+        suiteSetup(async () => {
+            server = new DebugMCPServer(port, 60, ['127.0.0.1', '::1'], token);
+            await server.initialize();
+            await server.start();
+        });
+
+        suiteTeardown(async () => {
+            await server.stop();
+        });
+
+        function postMcp(extra: { headers?: http.OutgoingHttpHeaders; query?: string } = {}): Promise<{ status: number; body: string }> {
+            const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} });
+            const opts: http.RequestOptions = {
+                host: '127.0.0.1',
+                port,
+                path: `/mcp${extra.query ?? ''}`,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json, text/event-stream',
+                    'Content-Length': Buffer.byteLength(body).toString(),
+                    'Host': `127.0.0.1:${port}`,
+                    ...extra.headers
+                }
+            };
+            return new Promise((resolve, reject) => {
+                const req = http.request(opts, res => {
+                    let data = '';
+                    res.on('data', c => data += c);
+                    res.on('end', () => resolve({ status: res.statusCode || 0, body: data }));
+                });
+                req.on('error', reject);
+                req.write(body);
+                req.end();
+            });
+        }
+
+        test('request without a token is rejected (401)', async () => {
+            const res = await postMcp();
+            assert.strictEqual(res.status, 401, `expected 401 without token, got ${res.status}: ${res.body}`);
+        });
+
+        test('request with a wrong token is rejected (401)', async () => {
+            const res = await postMcp({ headers: { Authorization: 'Bearer wrong-token' } });
+            assert.strictEqual(res.status, 401, `expected 401 for wrong token, got ${res.status}: ${res.body}`);
+        });
+
+        test('request with the correct Bearer header is accepted', async () => {
+            const res = await postMcp({ headers: { Authorization: `Bearer ${token}` } });
+            assert.notStrictEqual(res.status, 401, `valid Bearer token was rejected: ${res.body}`);
+            assert.notStrictEqual(res.status, 403, `valid Bearer token hit the rebinding guard: ${res.body}`);
+        });
+
+        test('request with the correct ?token= query param is accepted', async () => {
+            const res = await postMcp({ query: `?token=${encodeURIComponent(token)}` });
+            assert.notStrictEqual(res.status, 401, `valid query token was rejected: ${res.body}`);
+            assert.notStrictEqual(res.status, 403, `valid query token hit the rebinding guard: ${res.body}`);
         });
     });
 });

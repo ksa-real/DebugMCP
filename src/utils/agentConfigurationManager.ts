@@ -89,12 +89,14 @@ export class AgentConfigurationManager {
     private readonly POPUP_SHOWN_KEY = 'debugmcp.popupShown';
     private readonly timeoutInSeconds: number;
     private readonly serverPort: number;
-    
+    private readonly authToken?: string;
 
-    constructor(context: vscode.ExtensionContext, timeoutInSeconds: number, serverPort: number) {
+
+    constructor(context: vscode.ExtensionContext, timeoutInSeconds: number, serverPort: number, authToken?: string) {
         this.context = context;
         this.timeoutInSeconds = timeoutInSeconds;
         this.serverPort = serverPort;
+        this.authToken = authToken;
     }
 
     /**
@@ -345,7 +347,11 @@ export class AgentConfigurationManager {
     }
 
     private getMCPServerUrl(): string {
-        return `http://localhost:${this.serverPort}/mcp`;
+        const base = `http://localhost:${this.serverPort}/mcp`;
+        // Carry the auth token as a query param so it works uniformly across every
+        // client config format (JSON + Codex TOML) and around Cursor's dropped-header
+        // bug. The server also accepts an `Authorization: Bearer` header.
+        return this.authToken ? `${base}?token=${encodeURIComponent(this.authToken)}` : base;
     }
 
     /**
@@ -365,20 +371,18 @@ export class AgentConfigurationManager {
                 const configContent = await fs.promises.readFile(agent.configPath, 'utf8');
 
                 if (agent.configFormat === 'toml') {
-                    if (this.shouldMigrateCodexConfig(configContent)) {
-                        await fs.promises.writeFile(
-                            agent.configPath,
-                            upsertCodexDebugMCPConfig(configContent, this.getMCPServerUrl()),
-                            'utf8'
-                        );
-
-                        migrationCount++;
-                        console.log(`Successfully migrated ${agent.displayName} configuration`);
-                    }
-
-                    // Back-compat: existing Codex users had only the MCP server registered.
-                    // If DebugMCP is configured, also ensure the bundled skill is installed.
+                    // Refresh the Codex section when it migrates from /sse OR when the
+                    // URL is otherwise out of date (e.g. an auth token was added/rotated).
                     if (this.hasCodexDebugMCPSection(configContent)) {
+                        const updatedContent = upsertCodexDebugMCPConfig(configContent, this.getMCPServerUrl());
+                        if (updatedContent !== configContent) {
+                            await fs.promises.writeFile(agent.configPath, updatedContent, 'utf8');
+                            migrationCount++;
+                            console.log(`Successfully migrated ${agent.displayName} configuration`);
+                        }
+
+                        // Back-compat: existing Codex users had only the MCP server registered.
+                        // If DebugMCP is configured, also ensure the bundled skill is installed.
                         await this.ensureSkillRegistered(agent);
                     }
 
@@ -400,12 +404,17 @@ export class AgentConfigurationManager {
                     continue; // DebugMCP not configured for this agent
                 }
 
-                // Check if it's using the old SSE configuration
+                // Check if it's using the old SSE configuration, or if the stored
+                // URL no longer matches the desired one (e.g. the auth token was
+                // added/rotated and an existing entry must be refreshed so it keeps
+                // authenticating).
+                const urlOutOfDate = debugmcpConfig.url !== this.getMCPServerUrl();
                 const needsMigration = agent.id === 'copilot-cli'
-                    ? debugmcpConfig.type !== 'http' || (debugmcpConfig.url && debugmcpConfig.url.endsWith('/sse'))
+                    ? debugmcpConfig.type !== 'http' || (debugmcpConfig.url && debugmcpConfig.url.endsWith('/sse')) || urlOutOfDate
                     : debugmcpConfig.type === 'sse' ||
                     debugmcpConfig.type === 'http' ||
-                    (debugmcpConfig.url && debugmcpConfig.url.endsWith('/sse'));
+                    (debugmcpConfig.url && debugmcpConfig.url.endsWith('/sse')) ||
+                    urlOutOfDate;
 
                 if (needsMigration) {
                     console.log(`Migrating DebugMCP configuration for ${agent.displayName} from SSE to streamableHttp`);
@@ -462,27 +471,6 @@ export class AgentConfigurationManager {
     private hasCodexDebugMCPSection(configContent: string): boolean {
         const lines = configContent.replace(/\r\n/g, '\n').split('\n');
         return lines.some(line => isCodexDebugMCPSectionHeader(line));
-    }
-
-    private shouldMigrateCodexConfig(configContent: string): boolean {
-        const normalizedConfigContent = configContent.replace(/\r\n/g, '\n');
-        const lines = normalizedConfigContent.split('\n');
-        const debugMCPSectionIndex = lines.findIndex(line => isCodexDebugMCPSectionHeader(line));
-
-        if (debugMCPSectionIndex === -1) {
-            return false;
-        }
-
-        const nextSectionIndex = findNextTomlSectionIndex(lines, debugMCPSectionIndex + 1);
-        const debugMCPSectionEndIndex = nextSectionIndex === -1 ? lines.length : nextSectionIndex;
-
-        for (let index = debugMCPSectionIndex + 1; index < debugMCPSectionEndIndex; index++) {
-            if (/^\s*url\s*=.*\/sse["']?\s*(?:#.*)?$/.test(lines[index])) {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     /**

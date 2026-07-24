@@ -50,6 +50,12 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "debugmcp.serverProvider",
+        "label": "DebugMCP"
+      }
+    ],
     "commands": [
       {
         "command": "debugmcp.showAgentSelectionPopup",
@@ -90,7 +96,7 @@
             "127.0.0.1",
             "::1"
           ],
-          "markdownDescription": "Network interface(s) the DebugMCP HTTP server binds to. **Defaults to `[\"127.0.0.1\", \"::1\"]` (IPv4 + IPv6 loopback only).** Accepts a single string or an array of strings. ⚠️ **Security warning:** changing this to `0.0.0.0` or a LAN address exposes the unauthenticated MCP debugger — including arbitrary code execution via `evaluate_expression` and `start_debugging` — to every host on the network. Only change this if you fully understand the risk."
+          "markdownDescription": "Network interface(s) the DebugMCP HTTP server binds to. **Defaults to `[\"127.0.0.1\", \"::1\"]` (IPv4 + IPv6 loopback only).** Accepts a single string or an array of strings. The server requires a per-install auth token, but ⚠️ **changing this to `0.0.0.0` or a LAN address still exposes the MCP debugger — including arbitrary code execution via `evaluate_expression` and `start_debugging` — to every host on the network.** Only change this if you fully understand the risk."
         }
       }
     }
