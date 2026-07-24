@@ -12,6 +12,8 @@ VS Code's debug API is powerful but requires careful handling. `DebuggingExecuto
 
 - Execute VS Code debug commands (step, continue, restart, etc.)
 - Start and stop debug sessions
+- Capture accepted launch and resolved session information
+- Wait explicitly for stop or termination events when requested
 - Manage breakpoints (add, remove, list, clear)
 - Retrieve current debug state (file, line, frame info)
 - Execute DAP custom requests for variables and expression evaluation
@@ -60,11 +62,7 @@ For data retrieval, the executor uses DAP's custom request mechanism:
 
 ### Session Readiness
 
-A session is considered "ready" when:
-1. `vscode.debug.activeDebugSession` exists
-2. Location info is available (file name and line number)
-
-This handles cases where the debugger is still initializing (common with Python).
+Control commands do not wait for session readiness or the next breakpoint. The separate `waitForDebugStop()` operation listens for a stack-frame selection or termination and always has a timeout.
 
 ### State Retrieval
 

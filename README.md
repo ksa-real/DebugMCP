@@ -50,13 +50,15 @@ DebugMCP is an MCP server that gives AI coding agents full control over the VS C
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| **start_debugging** | Start a debug session for a source code file | `fileFullPath` (required)<br>`workingDirectory` (required)<br>`testName` (optional)<br>`configurationName` (optional) |
+| **start_debugging** | Start a debug session and return after VS Code accepts it | `fileFullPath` (required)<br>`workingDirectory` (required)<br>`testName` (optional)<br>`configurationName` (optional) |
+| **start_debugging_with_config** | Start from an inline launch configuration and return after VS Code accepts it | `configuration` (required)<br>`workingDirectory` (required) |
 | **stop_debugging** | Stop the current debug session | None |
-| **step_over** | Execute the next line (step over function calls) | None |
-| **step_into** | Step into function calls | None |
-| **step_out** | Step out of the current function | None |
-| **continue_execution** | Continue until next breakpoint | None |
-| **restart_debugging** | Restart the current debug session | None |
+| **step_over** | Request one step; optionally wait for its stop | `timeoutMs` (optional, maximum 300000) |
+| **step_into** | Request one step; optionally wait for its stop | `timeoutMs` (optional, maximum 300000) |
+| **step_out** | Request one step; optionally wait for its stop | `timeoutMs` (optional, maximum 300000) |
+| **continue_execution** | Resume execution; optionally wait for its next stop | `timeoutMs` (optional, maximum 300000) |
+| **wait_for_debug_stop** | Wait explicitly for pause or termination | `timeoutMs` (optional, maximum 300000) |
+| **restart_debugging** | Request a restart and return after acceptance | None |
 | **add_breakpoint** | Add a breakpoint at a specific line (optionally conditional) | `fileFullPath` (required)<br>`lineContent` (required)<br>`condition` (optional) |
 | **remove_breakpoint** | Remove a breakpoint from a specific line | `fileFullPath` (required)<br>`line` (required) |
 | **clear_all_breakpoints** | Remove all breakpoints at once | None |

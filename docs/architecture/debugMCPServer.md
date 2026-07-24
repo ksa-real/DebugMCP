@@ -64,10 +64,11 @@ Each request creates a new stateless `StreamableHTTPServerTransport` instance th
 
 | Tool | Description |
 |------|-------------|
-| `start_debugging` | Start a debug session |
+| `start_debugging` | Start a debug session and return after acceptance |
 | `stop_debugging` | Stop current session |
-| `step_over/into/out` | Stepping commands |
-| `continue_execution` | Continue to next breakpoint |
+| `step_over/into/out` | Dispatch stepping commands without waiting for the next stop |
+| `continue_execution` | Resume execution without waiting for the next stop |
+| `wait_for_debug_stop` | Explicit bounded wait for pause or termination |
 | `restart_debugging` | Restart session |
 | `add/remove_breakpoint` | Breakpoint management |
 | `clear_all_breakpoints` | Remove all breakpoints |
