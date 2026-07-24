@@ -9,21 +9,37 @@ import { logger } from './utils/logger';
  *
  * `started` indicates the command was dispatched successfully.
  * `runComplete` resolves when the underlying test run *finishes* (pass, fail,
- * or aborted). For .NET this includes the `dotnet test` parent/testhost
- * teardown. The handler races this against waitForDebugSessionReady so a test
- * that runs to completion without hitting a breakpoint is reported as
- * 'terminated' immediately instead of waiting for the configured timeout.
+ * or aborted). The start handler deliberately does not await it; it is retained
+ * so asynchronous command failures are observed instead of becoming unhandled.
  */
 export interface TestDebugDispatch {
     started: boolean;
     runComplete: Promise<void>;
 }
 
+export interface DebugSessionDetails {
+    id: string;
+    name: string;
+    type: string;
+    configuration: vscode.DebugConfiguration;
+}
+
+export interface DebugLaunchResult {
+    accepted: boolean;
+    session?: DebugSessionDetails;
+    terminated: boolean;
+}
+
+export type DebugStopWaitResult =
+    | { outcome: 'stopped' }
+    | { outcome: 'terminated' }
+    | { outcome: 'timeout' };
+
 /**
  * Interface for debugging execution operations
  */
 export interface IDebuggingExecutor {
-    startDebugging(workingDirectory: string, config: string | vscode.DebugConfiguration): Promise<boolean>;
+    startDebugging(workingDirectory: string, config: string | vscode.DebugConfiguration): Promise<DebugLaunchResult>;
     debugTestAtCursor(fileFullPath: string, testName: string): Promise<TestDebugDispatch>;
     stopDebugging(session?: vscode.DebugSession): Promise<void>;
     stepOver(): Promise<void>;
@@ -40,7 +56,17 @@ export interface IDebuggingExecutor {
     clearAllBreakpoints(): void;
     hasActiveSession(): Promise<boolean>;
     getActiveSession(): vscode.DebugSession | undefined;
-    waitForDebugSessionReady(timeoutMs: number): Promise<'stopped' | 'terminated' | 'timeout' | 'no-session'>;
+    waitForDebugStop(timeoutMs: number, signal?: AbortSignal): Promise<DebugStopWaitResult>;
+    executeControlAndWait(
+        control: () => Promise<void>,
+        timeoutMs: number,
+        signal?: AbortSignal
+    ): Promise<DebugStopWaitResult>;
+}
+
+interface DebugStopWaitHandle {
+    promise: Promise<DebugStopWaitResult>;
+    cancel: () => void;
 }
 
 /**
@@ -54,13 +80,43 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     public async startDebugging(
         workingDirectory: string, 
         config: string | vscode.DebugConfiguration
-    ): Promise<boolean> {
+    ): Promise<DebugLaunchResult> {
+        let startedSession: vscode.DebugSession | undefined;
+        let terminated = false;
+        const subscriptions = [
+            vscode.debug.onDidStartDebugSession(session => {
+                startedSession = session;
+            }),
+            vscode.debug.onDidTerminateDebugSession(session => {
+                if (startedSession?.id === session.id) {
+                    terminated = true;
+                }
+            })
+        ];
+
         try {
             const workspaceFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(workingDirectory));
-            return await vscode.debug.startDebugging(workspaceFolder, config);
+            const accepted = await vscode.debug.startDebugging(workspaceFolder, config);
+            const session = startedSession ?? vscode.debug.activeDebugSession;
+            return {
+                accepted,
+                session: session ? this.describeSession(session) : undefined,
+                terminated
+            };
         } catch (error) {
             throw new Error(`Failed to start debugging: ${error}`);
+        } finally {
+            subscriptions.forEach(subscription => subscription.dispose());
         }
+    }
+
+    private describeSession(session: vscode.DebugSession): DebugSessionDetails {
+        return {
+            id: session.id,
+            name: session.name,
+            type: session.type,
+            configuration: session.configuration
+        };
     }
 
     /**
@@ -102,11 +158,9 @@ export class DebuggingExecutor implements IDebuggingExecutor {
         }
 
         // `testing.debugAtCursor` resolves only when the entire test run
-        // *completes*, not when the debug session starts. We must not await
-        // it here — if the test hits a breakpoint, awaiting would block the
-        // handler forever. Instead, return the completion promise so the
-        // handler can race it against waitForDebugSessionReady: a clean run
-        // that never pauses will be reported as 'terminated' immediately.
+        // completes, not when the debug session starts. Dispatch it without
+        // awaiting so start_debugging returns promptly; retain the completion
+        // promise only to observe asynchronous command failures.
         const runComplete = Promise.resolve(vscode.commands.executeCommand('testing.debugAtCursor'))
             .then(() => undefined)
             .catch(err => {
@@ -559,95 +613,139 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     }
 
     /**
-     * Wait for the debug session to reach a steady, caller-actionable state.
+     * Explicitly wait for the active session to stop or terminate.
      *
-     * Returns when one of the following happens:
-     *  - 'stopped':    A stack frame is available (paused at breakpoint / entry / exception).
-     *                  Subsequent calls (step, get_variables, evaluate) can act immediately.
-     *  - 'terminated': The session ended (program ran to completion without stopping).
-     *  - 'no-session': No debug session ever started within the wait window.
-     *  - 'timeout':    A session is running but never stopped or terminated in time.
-     *
-     * Implemented with VS Code events rather than polling so we react the moment
-     * the state actually changes — important because a fast-running program can
-     * start *and* terminate inside a polling interval.
+     * Control commands never call this method implicitly. The bounded wait is
+     * exposed separately so MCP callers choose when occupying a request until
+     * the debugger becomes actionable.
      */
-    public async waitForDebugSessionReady(
-        timeoutMs: number
-    ): Promise<'stopped' | 'terminated' | 'timeout' | 'no-session'> {
-        // Helper: a session is only truly "stopped and actionable" when we have
-        // a DebugStackFrame (frameId present). A bare DebugThread means a thread
-        // is selected but the adapter hasn't published a frame yet — calling
-        // stackTrace/variables at that point can stall or return empty.
-        const isStoppedWithFrame = () => {
+    public async waitForDebugStop(timeoutMs: number, signal?: AbortSignal): Promise<DebugStopWaitResult> {
+        return await this.createDebugStopWait(timeoutMs, signal, true).promise;
+    }
+
+    /**
+     * Arm next-stop listeners before dispatching a control command.
+     *
+     * A debugger is normally paused when a step or continue command is issued.
+     * Waiting only after dispatch could mistake that pre-command stack frame for
+     * the result of the command. Arming first also prevents a fast stop event
+     * from landing between command acceptance and listener registration.
+     */
+    public async executeControlAndWait(
+        control: () => Promise<void>,
+        timeoutMs: number,
+        signal?: AbortSignal
+    ): Promise<DebugStopWaitResult> {
+        const wait = this.createDebugStopWait(timeoutMs, signal, false);
+        // Observe early cancellation while the VS Code command is still pending.
+        void wait.promise.catch(() => undefined);
+        if (signal?.aborted) {
+            return await wait.promise;
+        }
+
+        try {
+            await control();
+        } catch (error) {
+            wait.cancel();
+            throw error;
+        }
+
+        return await wait.promise;
+    }
+
+    private createDebugStopWait(
+        timeoutMs: number,
+        signal: AbortSignal | undefined,
+        includeCurrentStop: boolean
+    ): DebugStopWaitHandle {
+        const isStoppedWithFrame = (): boolean => {
             const item = vscode.debug.activeStackItem;
             return !!item && 'frameId' in item;
         };
 
-        if (isStoppedWithFrame()) {
-            return 'stopped';
-        }
-
+        const trackedSession = vscode.debug.activeDebugSession;
         const subscriptions: vscode.Disposable[] = [];
-        let trackedSession: vscode.DebugSession | undefined = vscode.debug.activeDebugSession;
+        let cancel = (): void => { /* initialized by the promise executor */ };
 
-        try {
-            return await new Promise<'stopped' | 'terminated' | 'timeout' | 'no-session'>(resolve => {
-                let settled = false;
-                const settle = (result: 'stopped' | 'terminated' | 'timeout' | 'no-session') => {
-                    if (settled) {
-                        return;
-                    }
-                    settled = true;
+        const promise = new Promise<DebugStopWaitResult>((resolve, reject) => {
+            let settled = false;
+            let timer: ReturnType<typeof setTimeout> | undefined;
+
+            const cleanup = (): void => {
+                if (timer) {
                     clearTimeout(timer);
-                    logger.info(`Debug session ready: ${result}`);
-                    resolve(result);
-                };
+                }
+                subscriptions.forEach(disposable => disposable.dispose());
+                signal?.removeEventListener('abort', onAbort);
+            };
+            const settle = (result: DebugStopWaitResult): void => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                cleanup();
+                logger.info(`Debug stop wait completed: ${result.outcome}`);
+                resolve(result);
+            };
+            const cancelWait = (): void => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                cleanup();
+                const error = new Error('Debug stop wait cancelled.');
+                error.name = 'AbortError';
+                reject(error);
+            };
+            const onAbort = (): void => {
+                logger.info('Debug stop wait cancelled by MCP client');
+                cancelWait();
+            };
+            cancel = cancelWait;
 
-                const timer = setTimeout(() => {
-                    settle(trackedSession ? 'timeout' : 'no-session');
-                }, timeoutMs);
+            if (signal?.aborted) {
+                cancelWait();
+                return;
+            }
+            if (includeCurrentStop && isStoppedWithFrame()) {
+                settle({ outcome: 'stopped' });
+                return;
+            }
+            if (!trackedSession) {
+                settle({ outcome: 'terminated' });
+                return;
+            }
 
-                subscriptions.push(
-                    vscode.debug.onDidStartDebugSession(session => {
-                        logger.info(`onDidStartDebugSession: ${session.name}`);
-                        trackedSession = session;
-                        setTimeout(() => {
-                            if (isStoppedWithFrame()) {
-                                settle('stopped');
-                            }
-                        }, 100);
-                    })
-                );
+            timer = setTimeout(() => {
+                settle({ outcome: 'timeout' });
+            }, timeoutMs);
 
-                subscriptions.push(
-                    vscode.debug.onDidChangeActiveStackItem(stackItem => {
-                        const kind = !stackItem
-                            ? 'cleared'
-                            : 'frameId' in stackItem ? 'frame' : 'thread';
-                        logger.info(`onDidChangeActiveStackItem: ${kind}`);
-                        // Only resolve when we have a stack frame. A bare
-                        // DebugThread can fire while the program is still
-                        // running, before the adapter publishes frame info.
-                        if (stackItem && 'frameId' in stackItem) {
-                            settle('stopped');
-                        }
-                    })
-                );
+            subscriptions.push(
+                vscode.debug.onDidChangeActiveStackItem(stackItem => {
+                    if (stackItem && 'frameId' in stackItem) {
+                        settle({ outcome: 'stopped' });
+                    }
+                })
+            );
 
-                subscriptions.push(
-                    vscode.debug.onDidTerminateDebugSession(session => {
-                        logger.info(`onDidTerminateDebugSession: ${session.name}, activeSession=${vscode.debug.activeDebugSession?.name ?? 'none'}`);
-                        // Only treat as 'terminated' if no other session is active.
-                        // dotnet test spawns a parent + testhost; wait for both to end.
-                        if (!vscode.debug.activeDebugSession) {
-                            settle('terminated');
-                        }
-                    })
-                );
-            });
-        } finally {
-            subscriptions.forEach(d => d.dispose());
-        }
+            subscriptions.push(
+                vscode.debug.onDidTerminateDebugSession(session => {
+                    if (session.id === trackedSession.id) {
+                        settle({ outcome: 'terminated' });
+                    }
+                })
+            );
+            signal?.addEventListener('abort', onAbort, { once: true });
+
+            // Register listeners before re-checking state so an event cannot
+            // land between inspection and subscription.
+            if (includeCurrentStop && isStoppedWithFrame()) {
+                settle({ outcome: 'stopped' });
+            } else if (!vscode.debug.activeDebugSession) {
+                settle({ outcome: 'terminated' });
+            }
+        });
+
+        return { promise, cancel };
     }
 }
