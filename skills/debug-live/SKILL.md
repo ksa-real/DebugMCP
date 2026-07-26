@@ -14,6 +14,7 @@ allowed-tools:
   - step_into
   - step_out
   - continue_execution
+  - wait_for_debug_stop
   - get_variables_values
   - evaluate_expression
 ---
@@ -53,13 +54,13 @@ If you can step through the code in a few tool calls, do that instead of specula
    data boundaries (where input enters, where output is produced).
 3. **Start the session.** Call `start_debugging` with the source file path. For a single
    test, pass `testName`; the server routes through VS Code's Testing API so test runners
-   like `dotnet test` / `pytest` / `jest` work correctly. The call returns when the
-   program either hits a breakpoint (`stopped`) or runs to completion without pausing
-   (`terminated`).
+   like `dotnet test` / `pytest` / `jest` work correctly. The call returns as soon as
+   VS Code accepts the request.
 4. **Navigate and inspect.** Use `step_over`, `step_into`, `step_out`, `continue_execution`
-   to move through code. Use `get_variables_values` to see local/global state and
-   `evaluate_expression` to test hypotheses live (call methods, read properties, run
-   list comprehensions, etc.).
+   to move through code. Omit `timeoutMs` to return after command acceptance, or
+   provide a bounded `timeoutMs` to wait for the resulting pause or termination in
+   the same call. Use `wait_for_debug_stop` when waiting separately, then inspect
+   with `get_variables_values` or `evaluate_expression`.
 5. **Find the root cause** (see framework below). Don't stop at the first wrong thing
    you see — trace it back to *why*.
 6. **Clean up.** Call `clear_all_breakpoints` when you're done so you don't pollute the
@@ -181,7 +182,8 @@ Before ending the debug session, confirm you can answer:
 ```text
 add_breakpoint  fileFullPath=/repo/src/calculate.py  lineContent="result = parse(raw)"
 start_debugging fileFullPath=/repo/src/calculate.py  workingDirectory=/repo
-# session pauses on the breakpoint
+wait_for_debug_stop timeoutMs=30000
+# session is now paused on the breakpoint
 get_variables_values scope=local
 evaluate_expression  expression="type(raw).__name__"
 step_into
@@ -193,6 +195,7 @@ clear_all_breakpoints
 ```text
 add_breakpoint  fileFullPath=C:\Repo\Calculator.Tests\CalculatorTests.cs  lineContent="Assert.Equal(5, _calc.Add(2, 3));"
 start_debugging fileFullPath=C:\Repo\Calculator.Tests\CalculatorTests.cs  workingDirectory=C:\Repo  testName=Add_ReturnsSum
+wait_for_debug_stop timeoutMs=30000
 # pauses inside the test
 step_into
 get_variables_values
@@ -203,6 +206,7 @@ get_variables_values
 restart_debugging
 # session restarts with the same configuration; breakpoints persist
 continue_execution
+wait_for_debug_stop timeoutMs=30000
 ```
 
 ---

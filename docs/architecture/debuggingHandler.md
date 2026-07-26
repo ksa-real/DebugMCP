@@ -2,16 +2,17 @@
 
 ## Purpose
 
-High-level orchestration layer that coordinates debugging operations between the MCP server and VS Code's debug API. Handles the asynchronous nature of debugging by implementing state change detection.
+High-level orchestration layer that coordinates debugging operations between the MCP server and VS Code's debug API. It keeps command dispatch separate from explicit waiting.
 
 ## Motivation
 
-Debugging is inherently asynchronous - when you step over a line, the debugger takes time to execute and update its state. AI agents need reliable feedback about when operations complete. `DebuggingHandler` bridges this gap by polling for state changes and returning meaningful responses.
+Debugging is inherently asynchronous, but an MCP control request should not occupy the caller until an unrelated future stop. `DebuggingHandler` returns once VS Code accepts start, continue, step, or restart commands. Callers that need the next stopped state use `wait_for_debug_stop` with a bounded timeout.
 
 ## Responsibility
 
 - Orchestrate debugging operations (start, stop, step, breakpoints)
-- Detect when debugger state has meaningfully changed after commands
+- Format prompt command-acceptance responses
+- Expose an explicit bounded wait for pause or termination
 - Format debug state into human/AI-readable responses
 - Provide root cause analysis guidance to AI agents
 - Manage operation timeouts
@@ -36,26 +37,9 @@ Debugging is inherently asynchronous - when you step over a line, the debugger t
 
 ## Key Concepts
 
-### State Change Detection
+### Dispatch and wait semantics
 
-After executing a debug command (step over, continue, etc.), the handler:
-1. Captures "before" state
-2. Executes the command via executor
-3. Polls for state changes using exponential backoff
-4. Returns the "after" state when a meaningful change is detected
-
-### Exponential Backoff
-
-Polling starts at 1 second intervals and increases exponentially (capped at 10 seconds for session activation, 1 second for state changes). Jitter is added to prevent thundering herd issues.
-
-### Meaningful State Changes
-
-A state change is considered meaningful when any of these change:
-- Session active status
-- Current file path
-- Current line number
-- Frame name (function/method)
-- Frame ID
+Start, continue, step, and restart commands report acceptance immediately. Launch responses also include the requested configuration name, resolved configuration and session identity when VS Code exposes them, and the current lifecycle state. `wait_for_debug_stop` listens for VS Code stack-frame or termination events and reports the stopped state or a clear timeout.
 
 ### Root Cause Analysis
 
@@ -65,14 +49,14 @@ When debugging stops, the handler prompts AI agents to consider whether they fou
 
 - Class definition: `src/debuggingHandler.ts`
 - Interface: `IDebuggingHandler`
-- State change detection: `waitForStateChange()`, `hasStateChanged()`
-- Session waiting: `waitForActiveDebugSession()`
+- Explicit stop wait: `handleWaitForDebugStop()`
+- Launch response formatting: `formatLaunchResult()`
 - State formatting: `formatDebugState()`
 
 ## Design Patterns
 
-- **Before/After Comparison**: All step operations capture state before and after
-- **Timeout Configuration**: Controlled by `timeoutInSeconds` parameter
+- **Command/Observation Separation**: Control operations dispatch; the explicit wait observes
+- **Bounded Waiting**: `wait_for_debug_stop` uses `timeoutInSeconds` or a per-call timeout, capped at 300 seconds
 - **Dependency Injection**: Executor and config manager are injected via constructor
 
 ## Error Handling

@@ -3,7 +3,7 @@
 import * as vscode from 'vscode';
 import { DebugConfigurationManager, IDebugConfigurationManager } from './utils/debugConfigurationManager';
 import { DebugState } from './debugState';
-import { IDebuggingExecutor } from './debuggingExecutor';
+import { DebugLaunchResult, DebugSessionDetails, IDebuggingExecutor } from './debuggingExecutor';
 import { logger } from './utils/logger';
 
 /**
@@ -13,10 +13,11 @@ export interface IDebuggingHandler {
     handleStartDebugging(args: { fileFullPath: string; workingDirectory: string; testName?: string; configurationName?: string }): Promise<string>;
     handleStartDebuggingWithConfig(args: { configuration: vscode.DebugConfiguration; workingDirectory: string }): Promise<string>;
     handleStopDebugging(): Promise<string>;
-    handleStepOver(): Promise<string>;
-    handleStepInto(): Promise<string>;
-    handleStepOut(): Promise<string>;
-    handleContinue(): Promise<string>;
+    handleStepOver(args?: { timeoutMs?: number }, signal?: AbortSignal): Promise<string>;
+    handleStepInto(args?: { timeoutMs?: number }, signal?: AbortSignal): Promise<string>;
+    handleStepOut(args?: { timeoutMs?: number }, signal?: AbortSignal): Promise<string>;
+    handleContinue(args?: { timeoutMs?: number }, signal?: AbortSignal): Promise<string>;
+    handleWaitForDebugStop(args?: { timeoutMs?: number }, signal?: AbortSignal): Promise<string>;
     handleRestart(): Promise<string>;
     handleAddBreakpoint(args: { fileFullPath: string; lineContent: string; condition?: string }): Promise<string>;
     handleRemoveBreakpoint(args: { fileFullPath: string; line: number }): Promise<string>;
@@ -30,8 +31,8 @@ export interface IDebuggingHandler {
  * Handles debugging operations using the executor and configuration manager
  */
 export class DebuggingHandler implements IDebuggingHandler {
+    private static readonly MAX_WAIT_TIMEOUT_MS = 300_000;
     private readonly numNextLines: number = 3;
-    private readonly executionDelay: number = 300; // ms to wait for debugger updates
     private readonly timeoutInSeconds: number;
 
     constructor(
@@ -59,65 +60,46 @@ export class DebuggingHandler implements IDebuggingHandler {
         try {
             logger.info(`handleStartDebugging: file=${fileFullPath} test=${testName ?? '<none>'} config=${configurationName ?? '<auto>'}`);
 
-            // Start listening BEFORE we trigger the debug session, otherwise
-            // `onDidStartDebugSession` / `onDidChangeActiveStackItem` can fire
-            // during the trigger call (testing.debugAtCursor / vscode.debug.startDebugging
-            // can resolve only after the session is already up) and we'd miss them.
-            const readyPromise = this.executor.waitForDebugSessionReady(this.timeoutInSeconds * 1000);
-
-            let started: boolean;
+            let launchResult: DebugLaunchResult;
             let configDescription: string;
-            let testRunComplete: Promise<void> | undefined;
+            let requestedConfigurationName: string;
 
             if (testName && !hasExplicitConfig) {
                 // Route through VS Code's Testing API. This works for any language
                 // whose extension registers a TestController and correctly handles
                 // child-process attach for runners like `dotnet test`.
                 const dispatch = await this.executor.debugTestAtCursor(fileFullPath, testName);
-                started = dispatch.started;
-                testRunComplete = dispatch.runComplete;
+                launchResult = {
+                    accepted: dispatch.started,
+                    session: this.describeActiveSession(),
+                    terminated: false
+                };
+                // Keep the command completion observed so a rejected Testing API
+                // promise is logged by the executor rather than becoming unhandled.
+                void dispatch.runComplete;
                 configDescription = `testing.debugAtCursor (test: ${testName})`;
+                requestedConfigurationName = configDescription;
             } else {
                 const debugConfig = await this.configManager.getDebugConfig(
                     workingDirectory,
                     fileFullPath,
                     configurationName
                 );
-                started = await this.executor.startDebugging(workingDirectory, debugConfig);
+                launchResult = await this.executor.startDebugging(workingDirectory, debugConfig);
                 const configName = typeof debugConfig === 'string' ? debugConfig : debugConfig.name;
                 configDescription = configName ? `configuration '${configName}'` : 'default configuration';
+                requestedConfigurationName = configName ?? 'default configuration';
             }
 
-            if (started) {
-                // Race the readiness signal against the test run completion. For .NET
-                // (and any runner where onDidTerminateDebugSession doesn't fire
-                // reliably for parent/child sessions), the test-run-complete signal
-                // is what tells us a clean run finished without ever pausing.
-                const readyState = testRunComplete
-                    ? await Promise.race([
-                        readyPromise,
-                        testRunComplete.then(() => 'terminated' as const)
-                    ])
-                    : await readyPromise;
-
-                logger.info(`handleStartDebugging: readyState=${readyState}, fetching current state…`);
-                const testInfo = testName ? ` (test: ${testName})` : '';
-                const currentState = await this.executor.getCurrentDebugState(this.numNextLines);
-                logger.info('handleStartDebugging: got current state, returning response');
-
-                switch (readyState) {
-                    case 'stopped':
-                        return `Debug session stopped at breakpoint for: ${fileFullPath} using ${configDescription}${testInfo}. Current state: ${currentState.toString()}`;
-                    case 'terminated':
-                        return `Debug session for ${fileFullPath} ran to completion without stopping (no breakpoint hit). Using ${configDescription}${testInfo}. Final state: ${currentState.toString()}`;
-                    case 'no-session':
-                        throw new Error('Debug session failed to start within the timeout period. Make sure the appropriate language extension is installed and any required build step succeeded.');
-                    case 'timeout':
-                        return `Debug session is running but did not stop or terminate within the timeout for: ${fileFullPath} using ${configDescription}${testInfo}. Current state: ${currentState.toString()}`;
-                }
-            } else {
+            if (!launchResult.accepted) {
                 throw new Error('Failed to start debug session. Make sure the appropriate language extension is installed.');
             }
+
+            logger.info(`handleStartDebugging: accepted using ${configDescription}`);
+            return await this.formatLaunchResult({
+                requestedConfigurationName,
+                launchResult
+            });
         } catch (error) {
             throw new Error(`Error starting debug session: ${error}`);
         }
@@ -141,37 +123,24 @@ export class DebuggingHandler implements IDebuggingHandler {
         try {
             this.validateConfiguration(configuration);
             const label = configuration.name || configuration.program || configuration.type;
-            const configDescription = `inline configuration '${label}'`;
             logger.info(
                 `handleStartDebuggingWithConfig: type=${configuration.type} ` +
                 `request=${configuration.request} program=${configuration.program ?? '<none>'} cwd=${workingDirectory}`
             );
 
-            // Subscribe to readiness BEFORE triggering the launch (see handleStartDebugging).
-            const readyPromise = this.executor.waitForDebugSessionReady(this.timeoutInSeconds * 1000);
-
-            const started = await this.executor.startDebugging(workingDirectory, configuration);
-            if (!started) {
+            const launchResult = await this.executor.startDebugging(workingDirectory, configuration);
+            if (!launchResult.accepted) {
                 throw new Error(
                     'Failed to start debug session. Make sure the appropriate language extension is ' +
                     'installed and the configuration is valid.'
                 );
             }
 
-            const readyState = await readyPromise;
-            logger.info(`handleStartDebuggingWithConfig: readyState=${readyState}, fetching current state…`);
-            const currentState = await this.executor.getCurrentDebugState(this.numNextLines);
-
-            switch (readyState) {
-                case 'stopped':
-                    return `Debug session stopped at breakpoint using ${configDescription}. Current state: ${currentState.toString()}`;
-                case 'terminated':
-                    return `Debug session ran to completion without stopping (no breakpoint hit) using ${configDescription}. Final state: ${currentState.toString()}`;
-                case 'no-session':
-                    throw new Error('Debug session failed to start within the timeout period. Make sure the appropriate language extension is installed and any required build step succeeded.');
-                case 'timeout':
-                    return `Debug session is running but did not stop or terminate within the timeout using ${configDescription}. Current state: ${currentState.toString()}`;
-            }
+            return await this.formatLaunchResult({
+                requestedConfigurationName: label,
+                requestedConfiguration: configuration,
+                launchResult
+            });
         } catch (error) {
             throw new Error(`Error starting debug session: ${error}`);
         }
@@ -237,22 +206,22 @@ export class DebuggingHandler implements IDebuggingHandler {
     /**
      * Execute step over command(s)
      */
-    public async handleStepOver(args?: { steps?: number }): Promise<string> {
+    public async handleStepOver(args?: { timeoutMs?: number }, signal?: AbortSignal): Promise<string> {
         try {
             if (!(await this.executor.hasActiveSession())) {
                 throw new Error('Debug session is not ready. Please wait for initialization to complete.');
             }
 
-            // Get the state before executing the command
-            const beforeState = await this.executor.getCurrentDebugState(this.numNextLines);
-
-            await this.executor.stepOver();
-            
-            // Wait for debugger state to change
-            const afterState = await this.waitForStateChange(beforeState);
-
-            return afterState.toString();
+            return await this.executeControl(
+                'step_over',
+                () => this.executor.stepOver(),
+                args?.timeoutMs,
+                signal
+            );
         } catch (error) {
+            if (this.isAbortError(error)) {
+                throw error;
+            }
             throw new Error(`Error executing step over: ${error}`);
         }
     }
@@ -260,22 +229,22 @@ export class DebuggingHandler implements IDebuggingHandler {
     /**
      * Execute step into command
      */
-    public async handleStepInto(): Promise<string> {
+    public async handleStepInto(args?: { timeoutMs?: number }, signal?: AbortSignal): Promise<string> {
         try {
             if (!(await this.executor.hasActiveSession())) {
                 throw new Error('Debug session is not ready. Please wait for initialization to complete.');
             }
 
-            // Get the state before executing the command
-            const beforeState = await this.executor.getCurrentDebugState(this.numNextLines);
-
-            await this.executor.stepInto();
-            
-            // Wait for debugger state to change
-            const afterState = await this.waitForStateChange(beforeState);
-            
-            return afterState.toString();
+            return await this.executeControl(
+                'step_into',
+                () => this.executor.stepInto(),
+                args?.timeoutMs,
+                signal
+            );
         } catch (error) {
+            if (this.isAbortError(error)) {
+                throw error;
+            }
             throw new Error(`Error executing step into: ${error}`);
         }
     }
@@ -283,22 +252,22 @@ export class DebuggingHandler implements IDebuggingHandler {
     /**
      * Execute step out command
      */
-    public async handleStepOut(): Promise<string> {
+    public async handleStepOut(args?: { timeoutMs?: number }, signal?: AbortSignal): Promise<string> {
         try {
             if (!(await this.executor.hasActiveSession())) {
                 throw new Error('Debug session is not ready. Please wait for initialization to complete.');
             }
 
-            // Get the state before executing the command
-            const beforeState = await this.executor.getCurrentDebugState(this.numNextLines);
-
-            await this.executor.stepOut();
-            
-            // Wait for debugger state to change
-            const afterState = await this.waitForStateChange(beforeState);
-            
-            return afterState.toString();
+            return await this.executeControl(
+                'step_out',
+                () => this.executor.stepOut(),
+                args?.timeoutMs,
+                signal
+            );
         } catch (error) {
+            if (this.isAbortError(error)) {
+                throw error;
+            }
             throw new Error(`Error executing step out: ${error}`);
         }
     }
@@ -306,24 +275,52 @@ export class DebuggingHandler implements IDebuggingHandler {
     /**
      * Continue execution
      */
-    public async handleContinue(): Promise<string> {
+    public async handleContinue(args?: { timeoutMs?: number }, signal?: AbortSignal): Promise<string> {
         try {
             if (!(await this.executor.hasActiveSession())) {
                 throw new Error('Debug session is not ready. Please wait for initialization to complete.');
             }
 
-            // Get the state before executing the command
-            const beforeState = await this.executor.getCurrentDebugState(this.numNextLines);
-
-            await this.executor.continue();
-            
-            // Wait for debugger state to change
-            const afterState = await this.waitForStateChange(beforeState);
-            
-            return afterState.toString();
+            return await this.executeControl(
+                'continue',
+                () => this.executor.continue(),
+                args?.timeoutMs,
+                signal
+            );
         } catch (error) {
+            if (this.isAbortError(error)) {
+                throw error;
+            }
             throw new Error(`Error executing continue: ${error}`);
         }
+    }
+
+    /**
+     * Explicitly wait for the active debuggee to stop or terminate.
+     */
+    public async handleWaitForDebugStop(
+        args?: { timeoutMs?: number },
+        signal?: AbortSignal
+    ): Promise<string> {
+        const timeoutMs = args?.timeoutMs === undefined
+            ? Math.min(this.timeoutInSeconds * 1000, DebuggingHandler.MAX_WAIT_TIMEOUT_MS)
+            : this.validateTimeoutMs(args.timeoutMs);
+
+        const result = await this.executor.waitForDebugStop(timeoutMs, signal);
+        const state = await this.executor.getCurrentDebugState(this.numNextLines);
+        const response: Record<string, unknown> = {
+            outcome: result.outcome,
+            timeoutMs,
+            state: JSON.parse(state.toString())
+        };
+
+        if (result.outcome === 'stopped') {
+            response.reason = this.inferStopReason(state);
+        } else if (result.outcome === 'timeout') {
+            response.message = `Debugger did not stop or terminate within ${timeoutMs} ms.`;
+        }
+
+        return JSON.stringify(response, null, 2);
     }
 
     /**
@@ -336,11 +333,7 @@ export class DebuggingHandler implements IDebuggingHandler {
             }
 
             await this.executor.restart();
-            
-            // Wait for debugger to restart
-            await new Promise(resolve => setTimeout(resolve, this.executionDelay));
-
-            return 'Debug session restarted successfully';
+            return this.formatControlAccepted('restart');
         } catch (error) {
             throw new Error(`Error restarting debug session: ${error}`);
         }
@@ -546,137 +539,147 @@ export class DebuggingHandler implements IDebuggingHandler {
         return await this.executor.hasActiveSession();
     }
 
-    /**
-     * Wait for the debugger to reach a new stopped frame (or end the session)
-     * after a step/continue, driven by VS Code debug events.
-     *
-     * The previous implementation polled `getCurrentDebugState` on a fixed ~1s
-     * interval: it checked once immediately (almost always too early — the DAP
-     * `stopped` event hasn't landed yet), then blind-slept ~1s before looking
-     * again. That cost ~1s per step/continue even though the operation itself
-     * completes in tens of milliseconds. There is no early-wakeup — a state
-     * change 10ms into the sleep is ignored for the rest of the second.
-     *
-     * This version subscribes to the same events the start path already uses
-     * (`onDidChangeActiveStackItem` for a new stopped frame, plus session
-     * termination) so it reacts the instant the step lands. A fast-path check
-     * covers the case where the step already completed before we got here, and
-     * a timeout bounds the no-event/never-stops case.
-     */
-    private async waitForStateChange(beforeState: DebugState): Promise<DebugState> {
-        const timeoutMs = this.timeoutInSeconds * 1000;
-        const subscriptions: vscode.Disposable[] = [];
-        const operatingSession = this.executor.getActiveSession();
-        let operatingSessionTerminated = false;
+    private async formatLaunchResult(args: {
+        requestedConfigurationName: string;
+        requestedConfiguration?: vscode.DebugConfiguration;
+        launchResult: DebugLaunchResult;
+    }): Promise<string> {
+        const state = await this.executor.getCurrentDebugState(this.numNextLines);
+        const session = args.launchResult.session ?? this.describeActiveSession();
+        const currentState = args.launchResult.terminated
+            ? 'terminated'
+            : state.hasValidContext()
+                ? 'paused'
+                : session || state.sessionActive
+                    ? 'running'
+                    : 'starting';
 
-        try {
-            await new Promise<void>(resolve => {
-                let settled = false;
-                const settle = () => {
-                    if (settled) {
-                        return;
-                    }
-                    settled = true;
-                    clearTimeout(timer);
-                    resolve();
-                };
-
-                const timer = setTimeout(() => {
-                    logger.info('State change detection timed out, returning current state');
-                    settle();
-                }, timeoutMs);
-
-                // Register listeners BEFORE the fast-path check so a stop that
-                // lands during that async check can't slip through unobserved.
-                subscriptions.push(
-                    vscode.debug.onDidChangeActiveStackItem(stackItem => {
-                        // A newly focused stack frame is the signal that the
-                        // step/continue has landed at its next stop.
-                        if (stackItem && 'frameId' in stackItem) {
-                            settle();
-                        }
-                    })
-                );
-                subscriptions.push(
-                    vscode.debug.onDidTerminateDebugSession(session => {
-                        // continue/step that runs the program to completion.
-                        if (operatingSession && session.id === operatingSession.id) {
-                            operatingSessionTerminated = true;
-                            settle();
-                        } else if (!vscode.debug.activeDebugSession) {
-                            settle();
-                        }
-                    })
-                );
-
-                // Fast path: the step/continue may already have landed by the
-                // time we subscribed (e.g. a trivial single-line step).
-                void this.executor.getCurrentDebugState(this.numNextLines).then(currentState => {
-                    if (this.hasStateChanged(beforeState, currentState) || !currentState.sessionActive) {
-                        settle();
-                    }
-                });
-            });
-        } finally {
-            subscriptions.forEach(d => d.dispose());
-        }
-
-        const afterState = await this.executor.getCurrentDebugState(this.numNextLines);
-        // The operating session ended (program ran to completion). A lingering
-        // parent session (e.g. the JS debug terminal) can leave a different
-        // session reported as active, so reflect termination explicitly here.
-        if (operatingSessionTerminated) {
-            afterState.sessionActive = false;
-        }
-        return afterState;
+        return JSON.stringify({
+            requestedConfigurationName: args.requestedConfigurationName,
+            requestedConfiguration: args.requestedConfiguration
+                ? this.sanitizeConfiguration(args.requestedConfiguration)
+                : undefined,
+            actualConfiguration: session
+                ? this.sanitizeConfiguration(session.configuration)
+                : undefined,
+            accepted: args.launchResult.accepted,
+            session: session
+                ? { id: session.id, name: session.name, type: session.type }
+                : undefined,
+            state: currentState,
+            stoppedState: currentState === 'paused' ? JSON.parse(state.toString()) : undefined
+        }, null, 2);
     }
 
-    /**
-     * Determine if the debugger state has meaningfully changed
-     */
-    private hasStateChanged(beforeState: DebugState, afterState: DebugState): boolean {
-        if (beforeState.hasLocationInfo() && !afterState.hasLocationInfo() && afterState.sessionActive) {
-            return false;
+    private describeActiveSession(): DebugSessionDetails | undefined {
+        const session = this.executor.getActiveSession();
+        if (!session) {
+            return undefined;
+        }
+        return {
+            id: session.id,
+            name: session.name,
+            type: session.type,
+            configuration: session.configuration
+        };
+    }
+
+    private formatControlAccepted(command: string): string {
+        const session = this.describeActiveSession();
+        return JSON.stringify({
+            command,
+            accepted: true,
+            session: session
+                ? { id: session.id, name: session.name, type: session.type }
+                : undefined,
+            state: 'running',
+            message: 'Command accepted. Use wait_for_debug_stop to wait for a pause or termination.'
+        }, null, 2);
+    }
+
+    private async executeControl(
+        command: string,
+        control: () => Promise<void>,
+        requestedTimeoutMs: number | undefined,
+        signal: AbortSignal | undefined
+    ): Promise<string> {
+        if (requestedTimeoutMs === undefined) {
+            await control();
+            return this.formatControlAccepted(command);
         }
 
-        // If session status changed, that's a meaningful change
-        if (beforeState.sessionActive !== afterState.sessionActive) {
-            return true;
+        const timeoutMs = this.validateTimeoutMs(requestedTimeoutMs);
+        const result = await this.executor.executeControlAndWait(control, timeoutMs, signal);
+        const state = await this.executor.getCurrentDebugState(this.numNextLines);
+        const session = this.describeActiveSession();
+        const response: Record<string, unknown> = {
+            command,
+            accepted: true,
+            timeoutMs,
+            outcome: result.outcome,
+            session: session
+                ? { id: session.id, name: session.name, type: session.type }
+                : undefined,
+            state: JSON.parse(state.toString())
+        };
+
+        if (result.outcome === 'stopped') {
+            response.reason = this.inferStopReason(state);
+        } else if (result.outcome === 'timeout') {
+            response.message =
+                `Command was accepted, but the debugger did not stop or terminate within ${timeoutMs} ms.`;
         }
-        
-        // If session is no longer active, that's a change
-        if (!afterState.sessionActive) {
-            return true;
+
+        return JSON.stringify(response, null, 2);
+    }
+
+    private validateTimeoutMs(timeoutMs: number): number {
+        if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+            throw new Error('timeoutMs must be a positive integer.');
         }
-        
-        // If either state lacks location info, compare what we can
-        if (!beforeState.hasLocationInfo() || !afterState.hasLocationInfo()) {
-            // If one has location info and the other doesn't, that's a change
-            return beforeState.hasLocationInfo() !== afterState.hasLocationInfo();
+        if (timeoutMs > DebuggingHandler.MAX_WAIT_TIMEOUT_MS) {
+            throw new Error(`timeoutMs must not exceed ${DebuggingHandler.MAX_WAIT_TIMEOUT_MS}.`);
         }
-        
-        // Compare file paths - if we moved to a different file, that's a change
-        if (beforeState.fileFullPath !== afterState.fileFullPath) {
-            return true;
+        return timeoutMs;
+    }
+
+    private isAbortError(error: unknown): error is Error {
+        return error instanceof Error && error.name === 'AbortError';
+    }
+
+    private inferStopReason(state: DebugState): string {
+        if (state.fileName && state.currentLine !== null) {
+            const location = `${state.fileName}:${state.currentLine}`;
+            if (state.breakpoints.some(breakpoint => breakpoint.startsWith(location))) {
+                return 'breakpoint';
+            }
         }
-        
-        // Compare line numbers - if we moved to a different line, that's a change
-        if (beforeState.currentLine !== afterState.currentLine) {
-            return true;
-        }
-        
-        // Compare frame names - if we moved to a different function/method, that's a change
-        if (beforeState.frameName !== afterState.frameName) {
-            return true;
-        }
-        
-        // Compare frame IDs - internal frame change
-        if (beforeState.frameId !== afterState.frameId) {
-            return true;
-        }
-        
-        // If we get here, no meaningful change was detected
-        return false;
+        return 'paused';
+    }
+
+    private sanitizeConfiguration(configuration: vscode.DebugConfiguration): unknown {
+        const sanitize = (value: unknown, parentKey?: string): unknown => {
+            if (Array.isArray(value)) {
+                return value.map(item => sanitize(item, parentKey));
+            }
+            if (!value || typeof value !== 'object') {
+                return value;
+            }
+
+            const result: Record<string, unknown> = {};
+            for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+                if (/token|password|secret|authorization|cookie|private.?key/i.test(key)) {
+                    result[key] = '[redacted]';
+                } else if (parentKey === 'env') {
+                    result[key] = '[redacted]';
+                } else {
+                    result[key] = sanitize(child, key);
+                }
+            }
+            return result;
+        };
+
+        return sanitize(configuration);
     }
 
     /**

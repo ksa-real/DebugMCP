@@ -210,9 +210,21 @@ export class DebugMCPServer {
      * `skills/debug-live/SKILL.md`.
      */
     private setupTools(server: McpServer) {
+        const controlWaitTimeout = z.number().int().positive().max(300_000).optional().describe(
+            'Optional bounded wait in milliseconds. Omit to return immediately after VS Code accepts the command; ' +
+            'provide a positive integer to wait at most that long for the next pause or termination. Prefer a short, ' +
+            'explicit timeout appropriate to the expected operation (for example, 30000). The MCP call remains open ' +
+            'while waiting, and client cancellation may not reach the server. If the timeout expires, use ' +
+            'wait_for_debug_stop for any additional bounded wait instead of repeating the control command.'
+        );
+
         // Start debugging tool
         server.registerTool('start_debugging', {
             description: 'Start a VS Code debug session for a source file, optionally for a single test method. ' +
+                'Returns promptly after VS Code accepts or rejects the launch request; it never waits for a breakpoint, pause, or termination. ' +
+                'The JSON response reports the requested configuration name, acceptance, resolved configuration and session ID/name/type when available, ' +
+                'and the immediate state (starting, running, paused, or terminated). If the session is already paused, it also includes stopped-state details. ' +
+                'Call wait_for_debug_stop explicitly when you need to wait for the next pause or termination. ' +
                 'Use when investigating bugs, failing tests, wrong/null variable values, unexpected runtime behavior, ' +
                 'or any "it doesn\'t work" report where stepping through the code is cheaper than speculation.',
             inputSchema: {
@@ -236,6 +248,10 @@ export class DebugMCPServer {
         // Start debugging from a raw inline configuration (language-agnostic).
         server.registerTool('start_debugging_with_config', {
             description: 'Start a VS Code debug session from a raw, caller-supplied launch.json-style configuration object — ' +
+                'returns promptly after VS Code accepts or rejects the launch request and never waits for a breakpoint, pause, or termination. ' +
+                'The JSON response reports the requested configuration, acceptance, resolved configuration and session ID/name/type when available, ' +
+                'and the immediate state (starting, running, paused, or terminated). If already paused, it also includes stopped-state details. ' +
+                'Call wait_for_debug_stop explicitly when you need to wait for the next pause or termination. ' +
                 'no launch.json entry required. Use this to debug an ARBITRARY program/command (any language with an ' +
                 'installed debug extension) when there is no suitable existing configuration. The caller owns all ' +
                 'toolchain specifics: e.g. for a TypeScript file pass {"type":"node","request":"launch","program":"...",' +
@@ -273,39 +289,65 @@ export class DebugMCPServer {
 
         // Step over tool
         server.registerTool('step_over', {
-            description: 'Execute the current line of code without diving into it.',
-        }, async () => {
-            const result = await this.debuggingHandler.handleStepOver();
+            description: 'Request one step over. Omit timeoutMs to return as soon as VS Code accepts the command; provide it to wait up to that many milliseconds for the next pause or termination and return stopped-state details.',
+            inputSchema: {
+                timeoutMs: controlWaitTimeout
+            },
+        }, async (args: { timeoutMs?: number }, extra) => {
+            const result = await this.debuggingHandler.handleStepOver(args, extra.signal);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
         // Step into tool
         server.registerTool('step_into', {
-            description: 'Dive into the current line of code.',
-        }, async () => {
-            const result = await this.debuggingHandler.handleStepInto();
+            description: 'Request one step into. Omit timeoutMs to return as soon as VS Code accepts the command; provide it to wait up to that many milliseconds for the next pause or termination and return stopped-state details.',
+            inputSchema: {
+                timeoutMs: controlWaitTimeout
+            },
+        }, async (args: { timeoutMs?: number }, extra) => {
+            const result = await this.debuggingHandler.handleStepInto(args, extra.signal);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
         // Step out tool
         server.registerTool('step_out', {
-            description: 'Step out of the current function',
-        }, async () => {
-            const result = await this.debuggingHandler.handleStepOut();
+            description: 'Request one step out. Omit timeoutMs to return as soon as VS Code accepts the command; provide it to wait up to that many milliseconds for the next pause or termination and return stopped-state details.',
+            inputSchema: {
+                timeoutMs: controlWaitTimeout
+            },
+        }, async (args: { timeoutMs?: number }, extra) => {
+            const result = await this.debuggingHandler.handleStepOut(args, extra.signal);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
         // Continue execution tool
         server.registerTool('continue_execution', {
-            description: 'Resume program execution until the next breakpoint is hit or the program completes.',
-        }, async () => {
-            const result = await this.debuggingHandler.handleContinue();
+            description: 'Request that execution resume. Omit timeoutMs to return as soon as VS Code accepts the command; provide it to wait up to that many milliseconds for the next pause or termination and return stopped-state details.',
+            inputSchema: {
+                timeoutMs: controlWaitTimeout
+            },
+        }, async (args: { timeoutMs?: number }, extra) => {
+            const result = await this.debuggingHandler.handleContinue(args, extra.signal);
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
+        server.registerTool('wait_for_debug_stop', {
+            description: 'Explicitly wait for the active debug session to pause or terminate, with a bounded timeout. Prefer an explicit short timeout (for example, 30000) and call this tool again if more waiting is needed; the MCP call remains open while waiting, and client cancellation may not reach the server. The JSON response outcome is stopped, terminated, or timeout. A stopped result includes the current source location, stack and breakpoint details, plus a stop reason when inferable; timeout returns a clear message.',
+            inputSchema: {
+                timeoutMs: z.number().int().positive().max(300_000).optional().describe(
+                    'Maximum milliseconds to wait. Prefer an explicit short value appropriate to the expected operation ' +
+                    '(for example, 30000); call wait_for_debug_stop again if more time is needed. If omitted, this defaults ' +
+                    'to debugmcp.timeoutInSeconds converted to milliseconds, capped at 300000.'
+                )
+            },
+        }, async (args: { timeoutMs?: number }, extra) => {
+            const result = await this.debuggingHandler.handleWaitForDebugStop(args, extra.signal);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
         // Restart debugging tool
         server.registerTool('restart_debugging', {
-            description: 'Restart the debug session from the beginning with the same configuration.',
+            description: 'Request a debug-session restart and return as soon as VS Code accepts the command. This never waits for the restarted session to pause or terminate; call wait_for_debug_stop explicitly when stopped-state details are needed.',
         }, async () => {
             const result = await this.debuggingHandler.handleRestart();
             return { content: [{ type: 'text' as const, text: result }] };

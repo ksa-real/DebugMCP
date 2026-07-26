@@ -49,10 +49,10 @@ Debugging operations are asynchronous - the debugger takes time to execute and u
 ## Usage Pattern
 
 ```
-1. Capture before state: beforeState = executor.getCurrentDebugState()
-2. Execute debug command
-3. Poll for changes: compare beforeState with currentState
-4. State changed when: file, line, frame, or session status differs
+1. Dispatch a start, continue, or step command
+2. Call wait_for_debug_stop explicitly when stopped state is needed
+3. Retrieve DebugState after the explicit wait reports "stopped"
+4. Inspect the current file, line, frame, stack, and breakpoints
 ```
 
 ## Design Notes
